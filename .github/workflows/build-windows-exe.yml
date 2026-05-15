@@ -1,0 +1,89 @@
+name: Build Windows EXE
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build xiaobudian image viewer exe
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+
+      - name: Install dependencies
+        shell: powershell
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e .
+          python -m pip install pyinstaller
+
+      - name: Verify source
+        shell: powershell
+        run: |
+          python -m py_compile run.py codex_image_viewer\app.py
+
+      - name: Build EXE
+        shell: cmd
+        run: build_exe.bat
+
+      - name: Prepare release assets
+        shell: powershell
+        run: |
+          Copy-Item -LiteralPath .\dist\xiaobudian-image-viewer.exe -Destination .\dist\xiaobudian-image-viewer-windows.exe -Force
+          Get-ChildItem -LiteralPath .\dist
+          Get-FileHash -LiteralPath .\dist\xiaobudian-image-viewer-windows.exe -Algorithm SHA256
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: xiaobudian-image-viewer-windows-exe
+          path: dist/xiaobudian-image-viewer-windows.exe
+          if-no-files-found: error
+
+      - name: Publish latest GitHub Release
+        shell: powershell
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG_NAME: windows-latest
+          RELEASE_NAME: Xiaobudian Image Viewer Windows Latest
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag -f $env:TAG_NAME $env:GITHUB_SHA
+          git push -f origin $env:TAG_NAME
+
+          @"
+          Automatic Windows executable build.
+          - File: xiaobudian-image-viewer-windows.exe
+          - Commit: $env:GITHUB_SHA
+          - Workflow run: $env:GITHUB_RUN_NUMBER
+          "@ | Set-Content -LiteralPath release-notes.md -Encoding UTF8
+
+          $ErrorActionPreference = "Continue"
+          gh api "repos/$env:GITHUB_REPOSITORY/releases/tags/$env:TAG_NAME" --silent 2>$null
+          $releaseExists = ($LASTEXITCODE -eq 0)
+          $ErrorActionPreference = "Stop"
+
+          if (-not $releaseExists) {
+            gh release create $env:TAG_NAME .\dist\xiaobudian-image-viewer-windows.exe --title $env:RELEASE_NAME --notes-file release-notes.md --latest
+          } else {
+            gh release upload $env:TAG_NAME .\dist\xiaobudian-image-viewer-windows.exe --clobber
+            gh release edit $env:TAG_NAME --title $env:RELEASE_NAME --notes-file release-notes.md --latest
+          }
+

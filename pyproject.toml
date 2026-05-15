@@ -1,0 +1,13 @@
+[project]
+name = "xiaobudian-image-viewer"
+version = "0.1.0"
+description = "Local realtime image directory previewer"
+requires-python = ">=3.10"
+dependencies = [
+  "Pillow>=10.0.0",
+]
+
+[project.scripts]
+xiaobudian-image-viewer = "codex_image_viewer.app:main"
+"小不点图片预览器" = "codex_image_viewer.app:main"
+codex-image-viewer = "codex_image_viewer.app:main"
