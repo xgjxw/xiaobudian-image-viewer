@@ -266,11 +266,13 @@ class CodexImageViewer(tk.Tk):
         self.selected_index = 0
         self.thumb_refs: dict[str, ImageTk.PhotoImage] = {}
         self.thumb_cache: dict[tuple[Path, int, float], ImageTk.PhotoImage] = {}
+        self.placeholder_cache: dict[int, ImageTk.PhotoImage] = {}
         self.group_cards: dict[Path, tuple[tk.Widget, ...]] = {}
         self.preview_ref: ImageTk.PhotoImage | None = None
         self.preview_image_id: int | None = None
         self.preview_text_id: int | None = None
         self.preview_image_box = (0, 0, 1, 1)
+        self.lazy_thumb_index = 0
         self.zoom = 1.0
         self.poll_ms = 1500
         self.last_signature: tuple[tuple[str, float, int], ...] = ()
@@ -281,6 +283,10 @@ class CodexImageViewer(tk.Tk):
         self.configure(bg=BG)
 
         self._build_ui()
+        self.status_var.set("正在启动，图片会在窗口打开后逐步加载...")
+        self.after(80, self._initial_load)
+
+    def _initial_load(self) -> None:
         self.refresh(force=True)
         self.after(self.poll_ms, self._poll)
 
@@ -480,6 +486,7 @@ class CodexImageViewer(tk.Tk):
         return group.images[self.selected_index]
 
     def _render_groups(self) -> None:
+        self.lazy_thumb_index = 0
         for child in self.list_body.winfo_children():
             child.destroy()
         self.group_cards.clear()
@@ -504,10 +511,8 @@ class CodexImageViewer(tk.Tk):
         card_widgets: list[tk.Widget] = [row, thumbs]
         for i, item in enumerate(group.images[:4]):
             key = f"group:{group.directory}:{i}:{item.path}"
-            thumb = self._make_thumb(item.path, 58)
-            self.thumb_refs[key] = thumb
             keys_to_keep.add(key)
-            label = tk.Label(thumbs, image=thumb, bg=bg, cursor="hand2")
+            label = self._lazy_thumb_label(thumbs, key, item.path, 58, bg)
             card_widgets.append(label)
             label.grid(row=i // 2, column=i % 2, padx=2, pady=2)
             label.bind("<Button-1>", lambda _event, d=group.directory: self._select_group(d))
@@ -543,14 +548,49 @@ class CodexImageViewer(tk.Tk):
             cell = tk.Frame(self.strip_body, bg=bg, padx=5, pady=5, highlightthickness=1, highlightbackground=LINE, cursor="hand2")
             cell.grid(row=0, column=idx, padx=(0, 8), sticky="n")
             key = f"strip:{idx}:{item.path}"
-            thumb = self._make_thumb(item.path, 84)
-            self.thumb_refs[key] = thumb
-            image_label = tk.Label(cell, image=thumb, bg=bg, cursor="hand2")
+            image_label = self._lazy_thumb_label(cell, key, item.path, 84, bg)
             image_label.pack()
             cell.bind("<Button-1>", lambda _event, i=idx: self._select_image(i))
             cell.bind("<MouseWheel>", lambda event: self._scroll_canvas(event, self.strip_canvas, horizontal=True))
             image_label.bind("<Button-1>", lambda _event, i=idx: self._select_image(i))
             image_label.bind("<MouseWheel>", lambda event: self._scroll_canvas(event, self.strip_canvas, horizontal=True))
+
+    def _lazy_thumb_label(self, parent: tk.Widget, key: str, path: Path, size: int, bg: str) -> tk.Label:
+        cached = self._cached_thumb(path, size)
+        thumb = cached or self._placeholder_thumb(size)
+        self.thumb_refs[key] = thumb
+        label = tk.Label(parent, image=thumb, bg=bg, cursor="hand2")
+        if cached is None:
+            delay = 20 + self.lazy_thumb_index * 12
+            self.lazy_thumb_index += 1
+            self.after(delay, lambda: self._finish_lazy_thumb(label, key, path, size))
+        return label
+
+    def _cached_thumb(self, path: Path, size: int) -> ImageTk.PhotoImage | None:
+        try:
+            mtime = path.stat().st_mtime
+        except OSError:
+            return None
+        return self.thumb_cache.get((path, size, mtime))
+
+    def _placeholder_thumb(self, size: int) -> ImageTk.PhotoImage:
+        cached = self.placeholder_cache.get(size)
+        if cached is not None:
+            return cached
+        canvas = Image.new("RGBA", (size, size), (247, 243, 246, 255))
+        thumb = ImageTk.PhotoImage(canvas)
+        self.placeholder_cache[size] = thumb
+        return thumb
+
+    def _finish_lazy_thumb(self, label: tk.Label, key: str, path: Path, size: int) -> None:
+        if not label.winfo_exists():
+            return
+        thumb = self._make_thumb(path, size)
+        self.thumb_refs[key] = thumb
+        try:
+            label.configure(image=thumb)
+        except tk.TclError:
+            pass
 
     def _make_thumb(self, path: Path, size: int) -> ImageTk.PhotoImage:
         try:
@@ -631,6 +671,12 @@ class CodexImageViewer(tk.Tk):
         self._show_selected()
 
     def _show_selected(self) -> None:
+        if not hasattr(self, "preview_canvas"):
+            return
+        if self.preview_canvas.winfo_width() <= 20 or self.preview_canvas.winfo_height() <= 20:
+            self.after(60, self._show_selected)
+            return
+
         item = self._current_item()
         if not item or not item.path.exists():
             self.preview_ref = None
