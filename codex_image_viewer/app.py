@@ -1,7 +1,9 @@
 from __future__ import annotations
 
-import os
+import ctypes
+import io
 import json
+import os
 import subprocess
 import sys
 import tkinter as tk
@@ -27,6 +29,9 @@ PINK = "#F4A3C0"
 GREEN = "#BDF0CD"
 LINE = "#E7D9E2"
 ACTIVE = "#FFF7C7"
+SCROLL_TRACK = "#FFF7FA"
+SCROLL_THUMB = "#F4A3C0"
+SCROLL_THUMB_ACTIVE = "#EC86AC"
 
 
 @dataclass(frozen=True)
@@ -43,19 +48,19 @@ class ImageGroup:
     mtime: float
 
 
-def list_groups(root: Path) -> list[ImageGroup]:
-    if not root.exists():
-        return []
-
+def list_groups(roots: list[Path]) -> list[ImageGroup]:
     grouped: dict[Path, list[ImageItem]] = {}
-    for path in root.rglob("*"):
-        if not path.is_file() or path.suffix.lower() not in IMAGE_EXTS:
+    for root in roots:
+        if not root.exists():
             continue
-        try:
-            stat = path.stat()
-        except OSError:
-            continue
-        grouped.setdefault(path.parent, []).append(ImageItem(path, stat.st_mtime, stat.st_size))
+        for path in root.rglob("*"):
+            if not path.is_file() or path.suffix.lower() not in IMAGE_EXTS:
+                continue
+            try:
+                stat = path.stat()
+            except OSError:
+                continue
+            grouped.setdefault(path.parent, []).append(ImageItem(path, stat.st_mtime, stat.st_size))
 
     groups: list[ImageGroup] = []
     for directory, images in grouped.items():
@@ -82,7 +87,7 @@ def middle_ellipsis(text: str, limit: int) -> str:
     return f"{text[:left]}...{text[-right:]}"
 
 
-def load_config() -> dict[str, str]:
+def load_config() -> dict:
     for path in (CONFIG_FILE, LEGACY_CONFIG_FILE):
         try:
             with path.open("r", encoding="utf-8") as fh:
@@ -93,19 +98,169 @@ def load_config() -> dict[str, str]:
     return {}
 
 
-def save_config(data: dict[str, str]) -> None:
+def dedupe_paths(paths: list[Path]) -> list[Path]:
+    seen: set[str] = set()
+    result: list[Path] = []
+    for path in paths:
+        text = str(path.expanduser())
+        key = text.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        result.append(Path(text))
+    return result
+
+
+def load_watch_dirs(config: dict, explicit: Path | None = None) -> list[Path]:
+    if explicit is not None:
+        return [explicit]
+    raw_dirs = config.get("watch_dirs")
+    if isinstance(raw_dirs, list):
+        paths = [Path(str(item)).expanduser() for item in raw_dirs if str(item).strip()]
+        if paths:
+            return dedupe_paths(paths)
+    legacy = config.get("watch_dir")
+    if legacy:
+        return [Path(str(legacy)).expanduser()]
+    return [DEFAULT_WATCH_DIR]
+
+
+def save_config(watch_dirs: list[Path]) -> None:
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
     with CONFIG_FILE.open("w", encoding="utf-8") as fh:
-        json.dump(data, fh, ensure_ascii=False, indent=2)
+        json.dump({"watch_dirs": [str(path) for path in watch_dirs]}, fh, ensure_ascii=False, indent=2)
+
+
+def copy_image_to_clipboard(path: Path) -> None:
+    if not sys.platform.startswith("win"):
+        raise RuntimeError("当前系统不支持直接复制图片到剪贴板。")
+
+    with Image.open(path) as img:
+        img = ImageOps.exif_transpose(img).convert("RGB")
+        buffer = io.BytesIO()
+        img.save(buffer, "BMP")
+        data = buffer.getvalue()[14:]
+
+    kernel32 = ctypes.windll.kernel32
+    user32 = ctypes.windll.user32
+    CF_DIB = 8
+    GMEM_MOVEABLE = 0x0002
+
+    kernel32.GlobalAlloc.argtypes = [ctypes.c_uint, ctypes.c_size_t]
+    kernel32.GlobalAlloc.restype = ctypes.c_void_p
+    kernel32.GlobalLock.argtypes = [ctypes.c_void_p]
+    kernel32.GlobalLock.restype = ctypes.c_void_p
+    kernel32.GlobalUnlock.argtypes = [ctypes.c_void_p]
+    kernel32.GlobalUnlock.restype = ctypes.c_bool
+    kernel32.GlobalFree.argtypes = [ctypes.c_void_p]
+    kernel32.GlobalFree.restype = ctypes.c_void_p
+    user32.OpenClipboard.argtypes = [ctypes.c_void_p]
+    user32.OpenClipboard.restype = ctypes.c_bool
+    user32.EmptyClipboard.restype = ctypes.c_bool
+    user32.SetClipboardData.argtypes = [ctypes.c_uint, ctypes.c_void_p]
+    user32.SetClipboardData.restype = ctypes.c_void_p
+    user32.CloseClipboard.restype = ctypes.c_bool
+
+    handle = kernel32.GlobalAlloc(GMEM_MOVEABLE, len(data))
+    if not handle:
+        raise RuntimeError("GlobalAlloc failed")
+    locked = kernel32.GlobalLock(handle)
+    if not locked:
+        kernel32.GlobalFree(handle)
+        raise RuntimeError("GlobalLock failed")
+    ctypes.memmove(locked, data, len(data))
+    kernel32.GlobalUnlock(handle)
+
+    if not user32.OpenClipboard(None):
+        kernel32.GlobalFree(handle)
+        raise RuntimeError("OpenClipboard failed")
+    try:
+        user32.EmptyClipboard()
+        if not user32.SetClipboardData(CF_DIB, handle):
+            kernel32.GlobalFree(handle)
+            raise RuntimeError("SetClipboardData failed")
+    finally:
+        user32.CloseClipboard()
+
+
+class SlimScrollbar(tk.Canvas):
+    def __init__(self, parent: tk.Widget, orient: str, command, bg: str) -> None:
+        self.orient = orient
+        self.command = command
+        self.first = 0.0
+        self.last = 1.0
+        self.dragging = False
+        size = 10
+        super().__init__(
+            parent,
+            width=size if orient == "vertical" else 1,
+            height=size if orient == "horizontal" else 1,
+            bg=bg,
+            highlightthickness=0,
+            bd=0,
+            cursor="hand2",
+        )
+        self.thumb_id: int | None = None
+        self.bind("<Configure>", lambda _event: self._redraw())
+        self.bind("<Button-1>", self._move_to_event)
+        self.bind("<B1-Motion>", self._move_to_event)
+        self.bind("<Enter>", lambda _event: self._paint_thumb(SCROLL_THUMB_ACTIVE))
+        self.bind("<Leave>", lambda _event: self._paint_thumb(SCROLL_THUMB))
+
+    def set(self, first: str, last: str) -> None:
+        self.first = max(0.0, min(1.0, float(first)))
+        self.last = max(0.0, min(1.0, float(last)))
+        self._redraw()
+
+    def _redraw(self) -> None:
+        self.delete("all")
+        width = max(1, self.winfo_width())
+        height = max(1, self.winfo_height())
+        self.create_rectangle(0, 0, width, height, fill=SCROLL_TRACK, outline="")
+
+        if self.last - self.first >= 0.999:
+            self.thumb_id = self.create_rectangle(0, 0, 0, 0, fill=SCROLL_TRACK, outline="")
+            return
+
+        if self.orient == "vertical":
+            length = height
+            min_len = min(42, max(18, length))
+            thumb_len = max(min_len, int(length * (self.last - self.first)))
+            start = int((length - thumb_len) * self.first / max(0.001, 1.0 - (self.last - self.first)))
+            self.thumb_id = self.create_rectangle(2, start, width - 2, start + thumb_len, fill=SCROLL_THUMB, outline="")
+        else:
+            length = width
+            min_len = min(48, max(22, length))
+            thumb_len = max(min_len, int(length * (self.last - self.first)))
+            start = int((length - thumb_len) * self.first / max(0.001, 1.0 - (self.last - self.first)))
+            self.thumb_id = self.create_rectangle(start, 2, start + thumb_len, height - 2, fill=SCROLL_THUMB, outline="")
+
+    def _paint_thumb(self, color: str) -> None:
+        if self.thumb_id is not None and self.last - self.first < 0.999:
+            self.itemconfigure(self.thumb_id, fill=color)
+
+    def _move_to_event(self, event: tk.Event) -> str:
+        if self.last - self.first >= 0.999:
+            return "break"
+        if self.orient == "vertical":
+            length = max(1, self.winfo_height())
+            thumb_len = max(18, int(length * (self.last - self.first)))
+            pos = event.y - thumb_len / 2
+            fraction = pos / max(1, length - thumb_len)
+        else:
+            length = max(1, self.winfo_width())
+            thumb_len = max(22, int(length * (self.last - self.first)))
+            pos = event.x - thumb_len / 2
+            fraction = pos / max(1, length - thumb_len)
+        self.command("moveto", max(0.0, min(1.0, fraction)))
+        return "break"
 
 
 class CodexImageViewer(tk.Tk):
     def __init__(self, watch_dir: Path | None = None) -> None:
         super().__init__()
         config = load_config()
-        configured_dir = config.get("watch_dir")
-        self.watch_dir = watch_dir or (Path(configured_dir) if configured_dir else DEFAULT_WATCH_DIR)
-        self.config_vars: dict[str, tk.StringVar] = {}
+        self.watch_dirs = load_watch_dirs(config, watch_dir)
         self.groups: list[ImageGroup] = []
         self.selected_dir: Path | None = None
         self.selected_index = 0
@@ -113,6 +268,7 @@ class CodexImageViewer(tk.Tk):
         self.thumb_cache: dict[tuple[Path, int, float], ImageTk.PhotoImage] = {}
         self.group_cards: dict[Path, tuple[tk.Widget, ...]] = {}
         self.preview_ref: ImageTk.PhotoImage | None = None
+        self.zoom = 1.0
         self.poll_ms = 1500
         self.last_signature: tuple[tuple[str, float, int], ...] = ()
 
@@ -137,13 +293,13 @@ class CodexImageViewer(tk.Tk):
         tk.Label(header, textvariable=self.status_var, bg=BG, fg=SOFT, font=("Microsoft YaHei UI", 10)).grid(row=1, column=0, sticky="w", pady=(4, 0))
         self._button(header, "刷新", self.refresh, PINK).grid(row=0, column=1, rowspan=2, padx=(8, 0))
         self._button(header, "系统配置", self._open_settings, "#FFE9A8").grid(row=0, column=2, rowspan=2, padx=(8, 0))
-        self._button(header, "打开监听目录", lambda: self._open_path(self.watch_dir), GREEN).grid(row=0, column=3, rowspan=2, padx=(8, 0))
+        self._button(header, "打开当前目录", self._open_selected_dir, GREEN).grid(row=0, column=3, rowspan=2, padx=(8, 0))
 
         sidebar = tk.Frame(self, bg=SIDEBAR, padx=12, pady=12, width=410)
         sidebar.grid(row=1, column=0, sticky="nsew", padx=(20, 10), pady=(0, 20))
         sidebar.grid_rowconfigure(1, weight=1)
         sidebar.grid_propagate(False)
-        tk.Label(sidebar, text="生成目录", bg=SIDEBAR, fg=TEXT, font=("Microsoft YaHei UI", 15, "bold")).grid(row=0, column=0, sticky="w", pady=(0, 10))
+        tk.Label(sidebar, text="图片目录", bg=SIDEBAR, fg=TEXT, font=("Microsoft YaHei UI", 15, "bold")).grid(row=0, column=0, sticky="w", pady=(0, 10))
 
         list_wrap, self.list_canvas, self.list_body = self._scroll_area(sidebar, SIDEBAR)
         list_wrap.grid(row=1, column=0, sticky="nsew")
@@ -157,12 +313,13 @@ class CodexImageViewer(tk.Tk):
         top.grid(row=0, column=0, sticky="ew", pady=(0, 12))
         top.grid_columnconfigure(0, weight=1)
         self.title_var = tk.StringVar(value="等待图片")
-        self.meta_var = tk.StringVar(value=str(self.watch_dir))
+        self.meta_var = tk.StringVar(value=self._watch_dirs_text())
         tk.Label(top, textvariable=self.title_var, bg=CARD, fg=TEXT, font=("Microsoft YaHei UI", 16, "bold")).grid(row=0, column=0, sticky="w")
         tk.Label(top, textvariable=self.meta_var, bg=CARD, fg=SOFT, font=("Microsoft YaHei UI", 10)).grid(row=1, column=0, sticky="w", pady=(4, 0))
         self._button(top, "上一张", self.prev_image, PINK).grid(row=0, column=1, rowspan=2, padx=(8, 0))
         self._button(top, "下一张", self.next_image, PINK).grid(row=0, column=2, rowspan=2, padx=(8, 0))
-        self._button(top, "打开当前目录", self._open_selected_dir, GREEN).grid(row=0, column=3, rowspan=2, padx=(8, 0))
+        self._button(top, "复制图片", self.copy_selected_image, GREEN).grid(row=0, column=3, rowspan=2, padx=(8, 0))
+        self._button(top, "重置缩放", self.zoom_reset, "#F4EAF0").grid(row=0, column=4, rowspan=2, padx=(8, 0))
 
         self.preview_area = tk.Frame(preview, bg="#F7F3F6")
         self.preview_area.grid(row=1, column=0, sticky="nsew")
@@ -171,8 +328,12 @@ class CodexImageViewer(tk.Tk):
         self.preview_label = tk.Label(self.preview_area, bg="#F7F3F6", fg=SOFT, text="暂无图片", font=("Microsoft YaHei UI", 16))
         self.preview_label.grid(row=0, column=0, sticky="nsew")
         self.preview_area.bind("<Configure>", lambda _event: self._show_selected())
+        self.preview_area.bind("<MouseWheel>", self._zoom_by_wheel)
+        self.preview_label.bind("<MouseWheel>", self._zoom_by_wheel)
         self.bind("<Left>", lambda _event: self.prev_image())
         self.bind("<Right>", lambda _event: self.next_image())
+        self.bind("<Control-c>", lambda _event: self.copy_selected_image())
+        self.bind("<Control-0>", lambda _event: self.zoom_reset())
 
         strip_wrap = tk.Frame(preview, bg=CARD)
         strip_wrap.grid(row=2, column=0, sticky="ew", pady=(12, 0))
@@ -187,19 +348,7 @@ class CodexImageViewer(tk.Tk):
         wrap.grid_rowconfigure(0, weight=1)
         canvas = tk.Canvas(wrap, bg=bg, highlightthickness=0)
         orient = "horizontal" if horizontal else "vertical"
-        scrollbar = tk.Scrollbar(
-            wrap,
-            orient=orient,
-            command=canvas.xview if horizontal else canvas.yview,
-            width=8,
-            bd=0,
-            relief="flat",
-            bg=PINK,
-            activebackground=PINK,
-            troughcolor="#FFF7FA",
-            highlightthickness=0,
-            elementborderwidth=0,
-        )
+        scrollbar = SlimScrollbar(wrap, orient=orient, command=canvas.xview if horizontal else canvas.yview, bg=bg)
         if horizontal:
             canvas.configure(xscrollcommand=scrollbar.set)
             canvas.grid(row=0, column=0, sticky="ew")
@@ -231,6 +380,16 @@ class CodexImageViewer(tk.Tk):
             canvas.yview_scroll(amount, "units")
         return "break"
 
+    def _zoom_by_wheel(self, event: tk.Event) -> str:
+        if self._current_item() is None:
+            return "break"
+        if event.delta > 0:
+            self.zoom = min(6.0, self.zoom * 1.12)
+        else:
+            self.zoom = max(0.2, self.zoom / 1.12)
+        self._show_selected()
+        return "break"
+
     def _poll(self) -> None:
         try:
             self.refresh(force=False)
@@ -238,7 +397,7 @@ class CodexImageViewer(tk.Tk):
             self.after(self.poll_ms, self._poll)
 
     def refresh(self, force: bool = True) -> None:
-        groups = list_groups(self.watch_dir)
+        groups = list_groups(self.watch_dirs)
         signature = tuple((str(item.path), item.mtime, item.size) for group in groups for item in group.images)
         if not force and signature == self.last_signature:
             return
@@ -249,11 +408,12 @@ class CodexImageViewer(tk.Tk):
         if old_dir not in existing_dirs:
             self.selected_dir = groups[0].directory if groups else None
             self.selected_index = 0
+            self.zoom = 1.0
         self._render_groups()
         self._render_strip()
         self._show_selected()
         image_count = sum(len(group.images) for group in groups)
-        self.status_var.set(f"监听：{self.watch_dir}    共 {len(groups)} 个目录 / {image_count} 张图片，自动刷新 {self.poll_ms / 1000:.1f}s")
+        self.status_var.set(f"监听 {len(self.watch_dirs)} 个目录    共 {len(groups)} 个图片目录 / {image_count} 张图片，自动刷新 {self.poll_ms / 1000:.1f}s")
 
     def _current_group(self) -> ImageGroup | None:
         if self.selected_dir is None:
@@ -275,7 +435,7 @@ class CodexImageViewer(tk.Tk):
         if not self.groups:
             tk.Label(self.list_body, text="还没有发现图片目录", bg=SIDEBAR, fg=SOFT, font=("Microsoft YaHei UI", 11)).pack(anchor="w", pady=20)
             return
-        for group in self.groups[:100]:
+        for group in self.groups[:160]:
             self._render_group_card(group, keys_to_keep)
         for key in list(self.thumb_refs):
             if key not in keys_to_keep:
@@ -310,8 +470,7 @@ class CodexImageViewer(tk.Tk):
         detail = tk.Label(info, text=f"{len(group.images)} 张图片", bg=bg, fg=SOFT, font=("Microsoft YaHei UI", 9), cursor="hand2")
         card_widgets.append(detail)
         detail.pack(anchor="w", pady=(4, 0))
-        latest = group.images[0].path.name
-        latest_label = tk.Label(info, text=middle_ellipsis(latest, 34), bg=bg, fg=SOFT, font=("Microsoft YaHei UI", 8), cursor="hand2")
+        latest_label = tk.Label(info, text=middle_ellipsis(str(group.directory), 38), bg=bg, fg=SOFT, font=("Microsoft YaHei UI", 8), cursor="hand2")
         card_widgets.append(latest_label)
         latest_label.pack(anchor="w", pady=(4, 0))
 
@@ -326,7 +485,7 @@ class CodexImageViewer(tk.Tk):
         group = self._current_group()
         if not group:
             return
-        for idx, item in enumerate(group.images[:80]):
+        for idx, item in enumerate(group.images[:120]):
             active = idx == self.selected_index
             bg = ACTIVE if active else "#F7F3F6"
             cell = tk.Frame(self.strip_body, bg=bg, padx=5, pady=5, highlightthickness=1, highlightbackground=LINE, cursor="hand2")
@@ -360,8 +519,8 @@ class CodexImageViewer(tk.Tk):
             canvas = Image.new("RGBA", (size, size), (240, 220, 230, 255))
         thumb = ImageTk.PhotoImage(canvas)
         self.thumb_cache[cache_key] = thumb
-        if len(self.thumb_cache) > 600:
-            for old_key in list(self.thumb_cache)[:120]:
+        if len(self.thumb_cache) > 900:
+            for old_key in list(self.thumb_cache)[:180]:
                 self.thumb_cache.pop(old_key, None)
         return thumb
 
@@ -371,6 +530,7 @@ class CodexImageViewer(tk.Tk):
         old_dir = self.selected_dir
         self.selected_dir = directory
         self.selected_index = 0
+        self.zoom = 1.0
         self._paint_group_card(old_dir, CARD)
         self._paint_group_card(directory, ACTIVE)
         self._render_strip()
@@ -387,6 +547,7 @@ class CodexImageViewer(tk.Tk):
 
     def _select_image(self, index: int) -> None:
         self.selected_index = index
+        self.zoom = 1.0
         self._render_strip()
         self._show_selected()
         self.after(20, lambda: self._scroll_strip_to_index(index))
@@ -395,7 +556,7 @@ class CodexImageViewer(tk.Tk):
         group = self._current_group()
         if not group or len(group.images) <= 1:
             return
-        visible_count = min(len(group.images), 80)
+        visible_count = min(len(group.images), 120)
         fraction = max(0.0, min(1.0, index / max(1, visible_count - 1)))
         self.strip_canvas.xview_moveto(fraction)
 
@@ -404,6 +565,7 @@ class CodexImageViewer(tk.Tk):
         if not group:
             return
         self.selected_index = (self.selected_index - 1) % len(group.images)
+        self.zoom = 1.0
         self._render_strip()
         self._show_selected()
 
@@ -412,6 +574,7 @@ class CodexImageViewer(tk.Tk):
         if not group:
             return
         self.selected_index = (self.selected_index + 1) % len(group.images)
+        self.zoom = 1.0
         self._render_strip()
         self._show_selected()
 
@@ -421,15 +584,16 @@ class CodexImageViewer(tk.Tk):
             self.preview_ref = None
             self.preview_label.configure(image="", text="暂无图片")
             self.title_var.set("等待图片")
-            self.meta_var.set(str(self.watch_dir))
+            self.meta_var.set(self._watch_dirs_text())
             return
 
         path = item.path
         try:
             with Image.open(path) as img:
+                original_w, original_h = img.size
                 img = ImageOps.exif_transpose(img).convert("RGBA")
-                area_w = max(300, self.preview_area.winfo_width() - 28)
-                area_h = max(300, self.preview_area.winfo_height() - 28)
+                area_w = max(300, int((self.preview_area.winfo_width() - 28) * self.zoom))
+                area_h = max(300, int((self.preview_area.winfo_height() - 28) * self.zoom))
                 img.thumbnail((area_w, area_h), Image.Resampling.LANCZOS)
                 self.preview_ref = ImageTk.PhotoImage(img)
         except Exception as exc:
@@ -437,76 +601,97 @@ class CodexImageViewer(tk.Tk):
             self.preview_label.configure(image="", text=f"图片读取失败：{exc}")
             return
         self.preview_label.configure(image=self.preview_ref, text="")
+        group = self._current_group()
+        count = len(group.images) if group else 1
+        self.title_var.set(f"{path.name}  ({self.selected_index + 1}/{count})")
+        self.meta_var.set(f"{original_w} × {original_h} · {human_size(item.size)} · 缩放 {self.zoom:.0%} · {path.parent}")
+
+    def copy_selected_image(self) -> None:
+        item = self._current_item()
+        if not item:
+            messagebox.showinfo("未选择图片", "请先选择一张图片。", parent=self)
+            return
         try:
-            with Image.open(path) as probe:
-                size_text = f"{probe.width} × {probe.height}"
-            group = self._current_group()
-            count = len(group.images) if group else 1
-            self.title_var.set(f"{path.name}  ({self.selected_index + 1}/{count})")
-            self.meta_var.set(f"{size_text} · {human_size(item.size)} · {path.parent}")
-        except OSError:
-            self.title_var.set(path.name)
-            self.meta_var.set(str(path.parent))
+            copy_image_to_clipboard(item.path)
+            self.status_var.set(f"已复制图片到剪贴板：{item.path.name}")
+        except Exception as exc:
+            self.clipboard_clear()
+            self.clipboard_append(str(item.path))
+            self.status_var.set(f"图片复制失败，已改为复制路径：{item.path}")
+            messagebox.showwarning("复制图片失败", f"{exc}\n\n已改为复制图片路径。", parent=self)
+
+    def zoom_reset(self) -> None:
+        self.zoom = 1.0
+        self._show_selected()
 
     def _open_selected_dir(self) -> None:
         if self.selected_dir:
             self._open_path(self.selected_dir)
-        else:
-            self._open_path(self.watch_dir)
+        elif self.watch_dirs:
+            self._open_path(self.watch_dirs[0])
 
     def _open_settings(self) -> None:
         win = tk.Toplevel(self)
         win.title("系统配置")
-        win.geometry("760x360")
-        win.minsize(680, 320)
+        win.geometry("800x460")
+        win.minsize(700, 390)
         win.configure(bg=BG)
         win.transient(self)
         win.grab_set()
 
         card = tk.Frame(win, bg=CARD, padx=24, pady=22, highlightthickness=1, highlightbackground=LINE)
         card.pack(fill="both", expand=True, padx=18, pady=18)
-        card.grid_columnconfigure(1, weight=1)
-        card.grid_rowconfigure(5, weight=1)
+        card.grid_columnconfigure(0, weight=1)
+        card.grid_rowconfigure(3, weight=1)
 
-        tk.Label(card, text="系统配置", bg=CARD, fg=TEXT, font=("Microsoft YaHei UI", 18, "bold")).grid(row=0, column=0, columnspan=3, sticky="w")
-        tk.Label(card, text="修改后会立即重新扫描目录。", bg=CARD, fg=SOFT, font=("Microsoft YaHei UI", 10)).grid(row=1, column=0, columnspan=3, sticky="w", pady=(8, 18))
+        tk.Label(card, text="系统配置", bg=CARD, fg=TEXT, font=("Microsoft YaHei UI", 18, "bold")).grid(row=0, column=0, sticky="w")
+        tk.Label(card, text="每行一个监听目录。保存后会立即重新扫描，只展示图片。", bg=CARD, fg=SOFT, font=("Microsoft YaHei UI", 10)).grid(row=1, column=0, sticky="w", pady=(8, 18))
+        tk.Label(card, text="监听目录", bg=CARD, fg=TEXT, font=("Microsoft YaHei UI", 10, "bold")).grid(row=2, column=0, sticky="w", pady=(0, 8))
 
-        watch_var = tk.StringVar(value=str(self.watch_dir))
-        self.config_vars["watch_dir"] = watch_var
-        tk.Label(card, text="监听目录", bg=CARD, fg=TEXT, font=("Microsoft YaHei UI", 10, "bold")).grid(row=2, column=0, sticky="w", pady=(0, 10))
-        entry = tk.Entry(card, textvariable=watch_var, bg="#F2FBF4", fg=TEXT, insertbackground=TEXT, relief="flat", bd=0, font=("Microsoft YaHei UI", 10))
-        entry.grid(row=2, column=1, sticky="ew", padx=(12, 8), ipady=8, pady=(0, 10))
-        self._button(card, "浏览", lambda: self._browse_watch_dir(watch_var), PINK).grid(row=2, column=2, pady=(0, 10))
-
-        hint = f"默认目录：{DEFAULT_WATCH_DIR}"
-        tk.Label(card, text=hint, bg=CARD, fg=SOFT, font=("Microsoft YaHei UI", 9)).grid(row=3, column=1, sticky="w", padx=(12, 0))
+        text = tk.Text(card, bg="#F2FBF4", fg=TEXT, insertbackground=TEXT, relief="flat", bd=0, font=("Microsoft YaHei UI", 10), height=8)
+        text.grid(row=3, column=0, sticky="nsew")
+        text.insert("1.0", "\n".join(str(path) for path in self.watch_dirs))
 
         actions = tk.Frame(card, bg=CARD)
-        actions.grid(row=6, column=0, columnspan=3, sticky="ew", pady=(24, 0))
-        self._button(actions, "恢复默认", lambda: watch_var.set(str(DEFAULT_WATCH_DIR)), "#F4EAF0").pack(side="left")
-        self._button(actions, "保存并刷新", lambda: self._save_settings(win, watch_var.get()), GREEN).pack(side="right")
+        actions.grid(row=4, column=0, sticky="ew", pady=(18, 0))
+        self._button(actions, "添加目录", lambda: self._browse_add_dir(text), PINK).pack(side="left")
+        self._button(actions, "恢复默认", lambda: self._replace_text(text, str(DEFAULT_WATCH_DIR)), "#F4EAF0").pack(side="left", padx=(8, 0))
+        self._button(actions, "保存并刷新", lambda: self._save_settings(win, text.get("1.0", "end")), GREEN).pack(side="right")
         self._button(actions, "取消", win.destroy, "#F4EAF0").pack(side="right", padx=(0, 8))
-        entry.focus_set()
+        text.focus_set()
 
-    def _browse_watch_dir(self, variable: tk.StringVar) -> None:
-        initial = variable.get().strip() or str(DEFAULT_WATCH_DIR)
-        path = filedialog.askdirectory(parent=self, title="选择监听目录", initialdir=initial if Path(initial).exists() else str(DEFAULT_WATCH_DIR.parent))
+    def _browse_add_dir(self, text: tk.Text) -> None:
+        initial = str(self.selected_dir or self.watch_dirs[0] if self.watch_dirs else DEFAULT_WATCH_DIR.parent)
+        path = filedialog.askdirectory(parent=self, title="添加监听目录", initialdir=initial if Path(initial).exists() else str(DEFAULT_WATCH_DIR.parent))
         if path:
-            variable.set(path)
+            current = text.get("1.0", "end").strip()
+            self._replace_text(text, f"{current}\n{path}" if current else path)
 
-    def _save_settings(self, win: tk.Toplevel, watch_dir_text: str) -> None:
-        path = Path(watch_dir_text.strip()).expanduser()
-        if not path.exists() or not path.is_dir():
-            messagebox.showerror("目录无效", "监听目录不存在或不是文件夹。", parent=win)
+    def _replace_text(self, text: tk.Text, value: str) -> None:
+        text.delete("1.0", "end")
+        text.insert("1.0", value)
+
+    def _save_settings(self, win: tk.Toplevel, raw_text: str) -> None:
+        paths = dedupe_paths([Path(line.strip()).expanduser() for line in raw_text.splitlines() if line.strip()])
+        if not paths:
+            messagebox.showerror("目录无效", "至少需要配置一个监听目录。", parent=win)
             return
-        self.watch_dir = path
-        save_config({"watch_dir": str(path)})
+        invalid = [path for path in paths if not path.exists() or not path.is_dir()]
+        if invalid:
+            messagebox.showerror("目录无效", f"这些路径不存在或不是文件夹：\n{chr(10).join(str(path) for path in invalid)}", parent=win)
+            return
+        self.watch_dirs = paths
+        save_config(paths)
         self.groups = []
         self.selected_dir = None
         self.selected_index = 0
+        self.zoom = 1.0
         self.last_signature = ()
         self.refresh(force=True)
         win.destroy()
+
+    def _watch_dirs_text(self) -> str:
+        return "；".join(str(path) for path in self.watch_dirs)
 
     def _open_path(self, path: Path) -> None:
         try:
@@ -517,7 +702,7 @@ class CodexImageViewer(tk.Tk):
             else:
                 subprocess.Popen(["xdg-open", str(path)])
         except Exception as exc:
-            messagebox.showerror("打开失败", str(exc))
+            messagebox.showerror("打开失败", str(exc), parent=self)
 
 
 def main() -> None:
