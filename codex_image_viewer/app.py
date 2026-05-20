@@ -268,6 +268,9 @@ class CodexImageViewer(tk.Tk):
         self.thumb_cache: dict[tuple[Path, int, float], ImageTk.PhotoImage] = {}
         self.group_cards: dict[Path, tuple[tk.Widget, ...]] = {}
         self.preview_ref: ImageTk.PhotoImage | None = None
+        self.preview_image_id: int | None = None
+        self.preview_text_id: int | None = None
+        self.preview_image_box = (0, 0, 1, 1)
         self.zoom = 1.0
         self.poll_ms = 1500
         self.last_signature: tuple[tuple[str, float, int], ...] = ()
@@ -325,15 +328,24 @@ class CodexImageViewer(tk.Tk):
         self.preview_area.grid(row=1, column=0, sticky="nsew")
         self.preview_area.grid_columnconfigure(0, weight=1)
         self.preview_area.grid_rowconfigure(0, weight=1)
-        self.preview_label = tk.Label(self.preview_area, bg="#F7F3F6", fg=SOFT, text="暂无图片", font=("Microsoft YaHei UI", 16))
-        self.preview_label.grid(row=0, column=0, sticky="nsew")
+        self.preview_canvas = tk.Canvas(self.preview_area, bg="#F7F3F6", highlightthickness=0)
+        self.preview_vbar = SlimScrollbar(self.preview_area, orient="vertical", command=self.preview_canvas.yview, bg="#F7F3F6")
+        self.preview_hbar = SlimScrollbar(self.preview_area, orient="horizontal", command=self.preview_canvas.xview, bg="#F7F3F6")
+        self.preview_canvas.configure(xscrollcommand=self.preview_hbar.set, yscrollcommand=self.preview_vbar.set)
+        self.preview_canvas.grid(row=0, column=0, sticky="nsew")
+        self.preview_vbar.grid(row=0, column=1, sticky="ns")
+        self.preview_hbar.grid(row=1, column=0, sticky="ew")
         self.preview_area.bind("<Configure>", lambda _event: self._show_selected())
-        self.preview_area.bind("<MouseWheel>", self._zoom_by_wheel)
-        self.preview_label.bind("<MouseWheel>", self._zoom_by_wheel)
+        self.preview_canvas.bind("<MouseWheel>", self._zoom_by_wheel)
+        self.preview_canvas.bind("<ButtonPress-1>", self._start_preview_pan)
+        self.preview_canvas.bind("<B1-Motion>", self._pan_preview)
         self.bind("<Left>", lambda _event: self.prev_image())
         self.bind("<Right>", lambda _event: self.next_image())
         self.bind("<Control-c>", lambda _event: self.copy_selected_image())
         self.bind("<Control-0>", lambda _event: self.zoom_reset())
+        self.bind("<plus>", lambda _event: self.zoom_in())
+        self.bind("<equal>", lambda _event: self.zoom_in())
+        self.bind("<minus>", lambda _event: self.zoom_out())
 
         strip_wrap = tk.Frame(preview, bg=CARD)
         strip_wrap.grid(row=2, column=0, sticky="ew", pady=(12, 0))
@@ -383,12 +395,52 @@ class CodexImageViewer(tk.Tk):
     def _zoom_by_wheel(self, event: tk.Event) -> str:
         if self._current_item() is None:
             return "break"
-        if event.delta > 0:
-            self.zoom = min(6.0, self.zoom * 1.12)
-        else:
-            self.zoom = max(0.2, self.zoom / 1.12)
-        self._show_selected()
+        self._set_zoom(self.zoom * (1.12 if event.delta > 0 else 1 / 1.12), event.x, event.y)
         return "break"
+
+    def _start_preview_pan(self, event: tk.Event) -> None:
+        self.preview_canvas.scan_mark(event.x, event.y)
+
+    def _pan_preview(self, event: tk.Event) -> str:
+        self.preview_canvas.scan_dragto(event.x, event.y, gain=1)
+        return "break"
+
+    def zoom_in(self) -> str:
+        self._set_zoom(self.zoom * 1.12)
+        return "break"
+
+    def zoom_out(self) -> str:
+        self._set_zoom(self.zoom / 1.12)
+        return "break"
+
+    def _set_zoom(self, zoom: float, anchor_x: int | None = None, anchor_y: int | None = None) -> None:
+        old_x, old_y, old_w, old_h = self.preview_image_box
+        if anchor_x is None:
+            anchor_x = max(1, self.preview_canvas.winfo_width()) // 2
+        if anchor_y is None:
+            anchor_y = max(1, self.preview_canvas.winfo_height()) // 2
+
+        canvas_x = self.preview_canvas.canvasx(anchor_x)
+        canvas_y = self.preview_canvas.canvasy(anchor_y)
+        rel_x = (canvas_x - old_x) / max(1, old_w)
+        rel_y = (canvas_y - old_y) / max(1, old_h)
+
+        self.zoom = max(0.2, min(6.0, zoom))
+        self._show_selected()
+
+        new_x, new_y, new_w, new_h = self.preview_image_box
+        target_x = new_x + rel_x * new_w - anchor_x
+        target_y = new_y + rel_y * new_h - anchor_y
+        self._move_preview_view(target_x, target_y)
+
+    def _move_preview_view(self, left: float, top: float) -> None:
+        bbox = self.preview_canvas.bbox("all")
+        if not bbox:
+            return
+        region_w = max(1, bbox[2] - bbox[0])
+        region_h = max(1, bbox[3] - bbox[1])
+        self.preview_canvas.xview_moveto(max(0.0, min(1.0, (left - bbox[0]) / region_w)))
+        self.preview_canvas.yview_moveto(max(0.0, min(1.0, (top - bbox[1]) / region_h)))
 
     def _poll(self) -> None:
         try:
@@ -582,7 +634,7 @@ class CodexImageViewer(tk.Tk):
         item = self._current_item()
         if not item or not item.path.exists():
             self.preview_ref = None
-            self.preview_label.configure(image="", text="暂无图片")
+            self._set_preview_message("暂无图片")
             self.title_var.set("等待图片")
             self.meta_var.set(self._watch_dirs_text())
             return
@@ -592,19 +644,45 @@ class CodexImageViewer(tk.Tk):
             with Image.open(path) as img:
                 original_w, original_h = img.size
                 img = ImageOps.exif_transpose(img).convert("RGBA")
-                area_w = max(300, int((self.preview_area.winfo_width() - 28) * self.zoom))
-                area_h = max(300, int((self.preview_area.winfo_height() - 28) * self.zoom))
-                img.thumbnail((area_w, area_h), Image.Resampling.LANCZOS)
+                viewport_w = max(1, self.preview_canvas.winfo_width() - 4)
+                viewport_h = max(1, self.preview_canvas.winfo_height() - 4)
+                fit_scale = min(viewport_w / max(1, img.width), viewport_h / max(1, img.height))
+                scale = max(0.01, fit_scale * self.zoom)
+                display_w = max(1, int(img.width * scale))
+                display_h = max(1, int(img.height * scale))
+                img = img.resize((display_w, display_h), Image.Resampling.LANCZOS)
                 self.preview_ref = ImageTk.PhotoImage(img)
         except Exception as exc:
             self.preview_ref = None
-            self.preview_label.configure(image="", text=f"图片读取失败：{exc}")
+            self._set_preview_message(f"图片读取失败：{exc}")
             return
-        self.preview_label.configure(image=self.preview_ref, text="")
+        self._set_preview_image(display_w, display_h)
         group = self._current_group()
         count = len(group.images) if group else 1
         self.title_var.set(f"{path.name}  ({self.selected_index + 1}/{count})")
         self.meta_var.set(f"{original_w} × {original_h} · {human_size(item.size)} · 缩放 {self.zoom:.0%} · {path.parent}")
+
+    def _set_preview_message(self, text: str) -> None:
+        self.preview_canvas.delete("all")
+        width = max(1, self.preview_canvas.winfo_width())
+        height = max(1, self.preview_canvas.winfo_height())
+        self.preview_text_id = self.preview_canvas.create_text(width // 2, height // 2, text=text, fill=SOFT, font=("Microsoft YaHei UI", 16))
+        self.preview_image_id = None
+        self.preview_image_box = (0, 0, 1, 1)
+        self.preview_canvas.configure(scrollregion=(0, 0, width, height))
+
+    def _set_preview_image(self, width: int, height: int) -> None:
+        canvas_w = max(1, self.preview_canvas.winfo_width())
+        canvas_h = max(1, self.preview_canvas.winfo_height())
+        x = max(0, (canvas_w - width) // 2)
+        y = max(0, (canvas_h - height) // 2)
+        self.preview_canvas.delete("all")
+        self.preview_image_id = self.preview_canvas.create_image(x, y, anchor="nw", image=self.preview_ref)
+        self.preview_text_id = None
+        self.preview_image_box = (x, y, width, height)
+        region_w = max(canvas_w, x + width)
+        region_h = max(canvas_h, y + height)
+        self.preview_canvas.configure(scrollregion=(0, 0, region_w, region_h))
 
     def copy_selected_image(self) -> None:
         item = self._current_item()
