@@ -1,7 +1,7 @@
 [project]
 name = "xiaobudian-image-viewer"
 version = "0.1.0"
-description = "Local realtime image directory previewer"
+description = "Local realtime image/audio/video directory previewer"
 requires-python = ">=3.10"
 dependencies = [
   "Pillow>=10.0.0",
