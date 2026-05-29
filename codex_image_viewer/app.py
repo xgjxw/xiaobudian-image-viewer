@@ -12,7 +12,7 @@ from enum import Enum
 from pathlib import Path
 from tkinter import filedialog, messagebox
 
-from PIL import Image, ImageDraw, ImageOps, ImageTk
+from PIL import Image, ImageDraw, ImageOps, ImageStat, ImageTk
 
 
 DEFAULT_WATCH_DIR = Path(r"C:\Users\Administrator\.codex\generated_images")
@@ -377,6 +377,7 @@ class CodexImageViewer(tk.Tk):
         self.selected_index = 0
         self.thumb_refs: dict[str, ImageTk.PhotoImage] = {}
         self.thumb_cache: dict[tuple[Path, int, float], ImageTk.PhotoImage] = {}
+        self.video_frame_cache: dict[tuple[Path, float], Image.Image | None] = {}
         self.icon_cache: dict[tuple[MediaKind, int], ImageTk.PhotoImage] = {}
         self.placeholder_cache: dict[int, ImageTk.PhotoImage] = {}
         self.group_cards: dict[Path, tuple[tk.Widget, ...]] = {}
@@ -814,24 +815,16 @@ class CodexImageViewer(tk.Tk):
             return self._icon_thumb(MediaKind.IMAGE, size)
 
     def _video_thumb(self, path: Path, size: int) -> Image.Image | None:
-        try:
-            import cv2  # type: ignore
-
-            cap = cv2.VideoCapture(str(path))
-            ok, frame = cap.read()
-            cap.release()
-            if not ok:
-                return None
-            frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGBA)
-            img = Image.fromarray(frame)
-            img.thumbnail((size, size), Image.Resampling.LANCZOS)
-            canvas = Image.new("RGBA", (size, size), (255, 255, 255, 255))
-            canvas.alpha_composite(img, ((size - img.width) // 2, (size - img.height) // 2))
-            draw = ImageDraw.Draw(canvas)
-            draw.polygon([(size * 0.42, size * 0.34), (size * 0.42, size * 0.66), (size * 0.68, size * 0.50)], fill=(255, 255, 255, 220), outline=(60, 40, 60))
-            return canvas
-        except Exception:
+        img = self._video_frame_image(path)
+        if img is None:
             return None
+        img = img.copy()
+        img.thumbnail((size, size), Image.Resampling.LANCZOS)
+        canvas = Image.new("RGBA", (size, size), (255, 255, 255, 255))
+        canvas.alpha_composite(img, ((size - img.width) // 2, (size - img.height) // 2))
+        draw = ImageDraw.Draw(canvas)
+        draw.polygon([(size * 0.42, size * 0.34), (size * 0.42, size * 0.66), (size * 0.68, size * 0.50)], fill=(255, 255, 255, 220), outline=(60, 40, 60))
+        return canvas
 
     def _icon_thumb(self, kind: MediaKind, size: int) -> Image.Image:
         cache_key = (kind, size)
@@ -1121,18 +1114,123 @@ class CodexImageViewer(tk.Tk):
             self._start_video(item.path)
 
     def _video_first_frame(self, path: Path) -> Image.Image | None:
+        return self._video_frame_image(path)
+
+    def _video_frame_image(self, path: Path) -> Image.Image | None:
+        try:
+            mtime = path.stat().st_mtime
+        except OSError:
+            mtime = 0
+        cache_key = (path, mtime)
+        if cache_key in self.video_frame_cache:
+            cached = self.video_frame_cache[cache_key]
+            return cached.copy() if cached is not None else None
+
+        candidates = self._video_frame_candidates_cv2(path)
+        if not candidates:
+            candidates = self._video_frame_candidates_ffmpeg(path)
+
+        best = self._best_video_frame(candidates)
+        self.video_frame_cache[cache_key] = best.copy() if best is not None else None
+        if len(self.video_frame_cache) > 300:
+            for old_key in list(self.video_frame_cache)[:60]:
+                self.video_frame_cache.pop(old_key, None)
+        return best
+
+    def _video_frame_candidates_cv2(self, path: Path) -> list[Image.Image]:
         try:
             import cv2  # type: ignore
 
             cap = cv2.VideoCapture(str(path))
-            ok, frame = cap.read()
+            if not cap.isOpened():
+                cap.release()
+                return []
+            fps = cap.get(cv2.CAP_PROP_FPS) or 24
+            frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+            duration = frame_count / fps if frame_count > 0 and fps > 0 else 0
+            times = self._video_sample_times(duration)
+            images: list[Image.Image] = []
+            for seconds in times:
+                cap.set(cv2.CAP_PROP_POS_MSEC, max(0.0, seconds) * 1000)
+                ok, frame = cap.read()
+                if ok:
+                    frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGBA)
+                    images.append(Image.fromarray(frame))
             cap.release()
-            if not ok:
-                return None
-            frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGBA)
-            return Image.fromarray(frame)
+            return images
         except Exception:
+            return []
+
+    def _video_frame_candidates_ffmpeg(self, path: Path) -> list[Image.Image]:
+        ffmpeg = self._ffmpeg_executable()
+        if not ffmpeg:
+            return []
+        candidates: list[Image.Image] = []
+        for seconds in self._video_sample_times(0):
+            args = [
+                ffmpeg,
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-ss",
+                f"{seconds:.3f}",
+                "-i",
+                str(path),
+                "-frames:v",
+                "1",
+                "-f",
+                "image2pipe",
+                "-vcodec",
+                "png",
+                "pipe:1",
+            ]
+            try:
+                proc = subprocess.run(args, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=8, check=False)
+                if proc.stdout:
+                    with Image.open(io.BytesIO(proc.stdout)) as img:
+                        candidates.append(img.convert("RGBA"))
+            except Exception:
+                continue
+        return candidates
+
+    def _ffmpeg_executable(self) -> str | None:
+        try:
+            import imageio_ffmpeg  # type: ignore
+
+            return imageio_ffmpeg.get_ffmpeg_exe()
+        except Exception:
+            pass
+        for name in ("ffmpeg", "ffmpeg.exe"):
+            try:
+                subprocess.run([name, "-version"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=2, check=False)
+                return name
+            except Exception:
+                continue
+        return None
+
+    def _video_sample_times(self, duration: float) -> list[float]:
+        if duration and duration > 2:
+            return [min(0.8, duration * 0.08), min(1.8, duration * 0.18), duration * 0.35, duration * 0.55]
+        return [0.0, 0.8, 1.8, 3.0]
+
+    def _best_video_frame(self, frames: list[Image.Image]) -> Image.Image | None:
+        if not frames:
             return None
+        scored: list[tuple[float, Image.Image]] = []
+        for frame in frames:
+            img = frame.convert("RGBA")
+            gray = img.convert("L").resize((96, 96), Image.Resampling.BILINEAR)
+            stat = ImageStat.Stat(gray)
+            mean = stat.mean[0]
+            variance = stat.var[0]
+            # Prefer frames with visible detail; avoid pure intro/black/white frames.
+            exposure_penalty = max(0.0, abs(mean - 128) - 95)
+            score = variance - exposure_penalty
+            scored.append((score, img))
+        best_score, best = max(scored, key=lambda item: item[0])
+        if best_score < 1 and len(scored) > 1:
+            return scored[0][1]
+        return best
 
     def _start_video(self, path: Path) -> None:
         self._stop_video()
@@ -1246,12 +1344,13 @@ class CodexImageViewer(tk.Tk):
                 messagebox.showerror("音频播放失败", str(exc), parent=self)
             return
         if item.kind == MediaKind.VIDEO:
-            self.status_var.set("视频已在程序内显示首帧预览；完整内嵌播放后续接入。")
+            self._draw_video_preview_frame(item, autoplay=True)
             return
         self._open_path(item.path)
 
     def stop_playback(self) -> None:
         self.audio_player.stop()
+        self._stop_video()
         self.status_var.set("已停止播放")
 
     def zoom_reset(self) -> None:

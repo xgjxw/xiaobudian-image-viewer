@@ -5,6 +5,7 @@ description = "Local realtime image/audio/video directory previewer"
 requires-python = ">=3.10"
 dependencies = [
   "Pillow>=10.0.0",
+  "imageio-ffmpeg>=0.5.1",
 ]
 
 [project.scripts]
